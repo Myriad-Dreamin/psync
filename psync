@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import subprocess
+import typing
+import configparser
+
+verbose = False
+
+remote_host: str
+remote_root: str
+local_root: str
+variables: 'typing.Dict[str, str]'
+directories: 'typing.List[str]'
+
+digest = {
+  'file_name': 'echo `realpath {}` {}',
+  'md5': 'echo `tar cf - -C {} . | md5sum | cut -d" " -f1` {}',
+  'ctime': 'stat -c "%W %n" {}',
+  'atime': 'stat -c "%X %n" {}',
+  'mtime': 'stat -c "%Z %n" {}',
+}
+digest_fn = 'mtime'
+
+
+def verbose_mapping(u, v): print(hu_path(u), '=>', hu_path(v)) if verbose else None
+def info_status(status, p): print(status, hu_path(p))
+def verbose_status(status, p): info_status(status, p) if verbose else None
+
+
+def ssh_exec(h, e):
+  return subprocess.check_output(['ssh', h, e]).decode()
+
+
+def get_stats(h, s):
+  return ssh_exec(h, f'''find {s} -mindepth 1 -maxdepth 1 | xargs -I{{}} sh -c '{digest[digest_fn]}' ''')
+
+
+def copy_dir(rem_host, rem, loc):
+  rem_tar_cmd = f'tar -C {os.path.dirname(rem)} -czf - {os.path.basename(rem)}'
+  loc_tar_cmd = f'tar -C {loc} -xzf -'
+  subprocess.check_call(f'''ssh {rem_host} '{rem_tar_cmd}' | {loc_tar_cmd}''', shell=True)
+
+
+def hash_is_consistent(local_hash_path, hash_content):
+  if not os.path.exists(local_hash_path):
+    return False
+  with open(local_hash_path, 'r') as f:
+    content = f.read()
+  return content == hash_content
+
+
+def hu_path(fn):
+  for d in directories:
+    fn = fn.replace(d, f'${{{os.path.basename(d)}}}')
+  for k, v in variables.items():
+    fn = fn.replace(v, f'${{{k}}}')
+  return fn
+
+
+def main():
+  global verbose, digest_fn, remote_host, remote_root, local_root, variables, directories
+
+  parser = argparse.ArgumentParser(description='python sync')
+  parser.add_argument('-v', '--verbose', action='store_true', help='show verbose status')
+  parser.add_argument('--dry', action='store_true', help='dry run')
+  parser.add_argument('--digest_fn', type=str, default=digest_fn, choices=digest.keys(),
+                      help='the digest method using for checking files')
+  parser.add_argument('-c', '--config', type=str, help='get sync arguments', required=True)
+
+  args = parser.parse_args()
+  config = configparser.ConfigParser(interpolation=configparser.ExtendedInterpolation())
+  config.read(args.config)
+
+  if args.verbose:
+    verbose = True
+  remote_host, remote_root = config['configs']['remote_host'], config['configs']['remote_root']
+  local_root = config['configs']['local_root']
+  variables = dict()
+  variables.update(config['vars'])
+  variables.update(config['configs'])
+  variables.pop('directories')
+  directories = map(lambda k: k.strip(), config['configs']['directories'].splitlines())
+  directories = list(filter(lambda k: k, directories))
+
+  stat_changed = 0
+  stat_consist = 0
+
+  for d in directories:
+    hashes = get_stats(remote_host, d)
+    for q in hashes.strip().splitlines():
+      state, fn = q.rsplit(' ')
+
+      # calculate paths
+      remote_rel = os.path.relpath(fn, remote_root)
+      local_fn = os.path.join(local_root, remote_rel)
+      local_hash = os.path.join(local_root, '.sync-hash', remote_rel + '.hash')
+      local_hash_dir = os.path.dirname(local_hash)
+      local_dir = os.path.dirname(local_fn)
+
+      verbose_mapping(fn, local_fn)
+
+      if hash_is_consistent(local_hash, state):
+        verbose_status(f'not-changed  {digest_fn}:{state}', fn)
+        stat_consist += 1
+        continue
+      stat_changed += 1
+
+      if args.dry:
+        info_status(f'remote-dirty {digest_fn}:{state}', fn)
+        continue
+
+      info_status('synchronizing', fn)
+      os.makedirs(local_hash_dir, exist_ok=True)
+      os.makedirs(local_dir, exist_ok=True)
+      copy_dir(remote_host, fn, local_dir)
+      with open(local_hash, 'w') as f:
+        f.write(state)
+
+      info_status('synchronized ', fn)
+    # end of for q in hashes.strip().splitlines()
+  # end of for d in directories
+
+  print('synchronization done, total',
+        stat_changed + stat_consist, 'dirents,',
+        stat_consist, 'consistent dirents,',
+        stat_changed, 'changed dirents')
+
+
+if __name__ == '__main__':
+  main()
